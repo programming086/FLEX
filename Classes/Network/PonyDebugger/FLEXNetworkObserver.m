@@ -14,13 +14,14 @@
 
 #import "FLEXNetworkObserver.h"
 #import "FLEXNetworkRecorder.h"
+#import "FLEXUtility.h"
 
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dispatch/queue.h>
 
 NSString *const kFLEXNetworkObserverEnabledStateChangedNotification = @"kFLEXNetworkObserverEnabledStateChangedNotification";
-static NSString *const kFLEXNetworkObserverEnableOnLaunchDefaultsKey = @"com.flex.FLEXNetworkObserver.enableOnLaunch";
+static NSString *const kFLEXNetworkObserverEnabledDefaultsKey = @"com.flex.FLEXNetworkObserver.enableOnLaunch";
 
 typedef void (^NSURLSessionAsyncCompletion)(id fileURLOrData, NSURLResponse *response, NSError *error);
 
@@ -67,7 +68,6 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 
 @interface FLEXNetworkObserver ()
 
-@property (nonatomic, assign, getter=isEnabled) BOOL enabled;
 @property (nonatomic, strong) NSMutableDictionary *requestStatesForRequestIDs;
 @property (nonatomic, strong) dispatch_queue_t queue;
 
@@ -79,43 +79,32 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 
 + (void)setEnabled:(BOOL)enabled
 {
+    BOOL previouslyEnabled = [self isEnabled];
+    
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kFLEXNetworkObserverEnabledDefaultsKey];
+    
     if (enabled) {
         // Inject if needed. This injection is protected with a dispatch_once, so we're ok calling it multiple times.
         // By doing the injection lazily, we keep the impact of the tool lower when this feature isn't enabled.
         [self injectIntoAllNSURLConnectionDelegateClasses];
     }
-    [[self sharedObserver] setEnabled:enabled];
-}
-
-+ (BOOL)isEnabled
-{
-    return [[self sharedObserver] isEnabled];
-}
-
-- (void)setEnabled:(BOOL)enabled
-{
-    if (_enabled != enabled) {
-        _enabled = enabled;
+    
+    if (previouslyEnabled != enabled) {
         [[NSNotificationCenter defaultCenter] postNotificationName:kFLEXNetworkObserverEnabledStateChangedNotification object:self];
     }
 }
 
-+ (void)setShouldEnableOnLaunch:(BOOL)shouldEnableOnLaunch
++ (BOOL)isEnabled
 {
-    [[NSUserDefaults standardUserDefaults] setObject:@YES forKey:kFLEXNetworkObserverEnableOnLaunchDefaultsKey];
-}
-
-+ (BOOL)shouldEnableOnLaunch
-{
-    return [[[NSUserDefaults standardUserDefaults] objectForKey:kFLEXNetworkObserverEnableOnLaunchDefaultsKey] boolValue];
+    return [[[NSUserDefaults standardUserDefaults] objectForKey:kFLEXNetworkObserverEnabledDefaultsKey] boolValue];
 }
 
 + (void)load
 {
     // We don't want to do the swizzling from +load because not all the classes may be loaded at this point.
     dispatch_async(dispatch_get_main_queue(), ^{
-        if ([self shouldEnableOnLaunch]) {
-            [self setEnabled:YES];
+        if ([self isEnabled]) {
+            [self injectIntoAllNSURLConnectionDelegateClasses];
         }
     });
 }
@@ -139,16 +128,19 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 
 #pragma mark Delegate Injection Convenience Methods
 
-+ (SEL)swizzledSelectorForSelector:(SEL)selector
-{
-    return NSSelectorFromString([NSString stringWithFormat:@"_flex_swizzle_%x_%@", arc4random(), NSStringFromSelector(selector)]);
-}
-
 /// All swizzled delegate methods should make use of this guard.
 /// This will prevent duplicated sniffing when the original implementation calls up to a superclass implementation which we've also swizzled.
 /// The superclass implementation (and implementations in classes above that) will be executed without inteference if called from the original implementation.
 + (void)sniffWithoutDuplicationForObject:(NSObject *)object selector:(SEL)selector sniffingBlock:(void (^)(void))sniffingBlock originalImplementationBlock:(void (^)(void))originalImplementationBlock
 {
+    // If we don't have an object to detect nested calls on, just run the original implmentation and bail.
+    // This case can happen if someone besides the URL loading system calls the delegate methods directly.
+    // See https://github.com/Flipboard/FLEX/issues/61 for an example.
+    if (!object) {
+        originalImplementationBlock();
+        return;
+    }
+
     const void *key = selector;
 
     // Don't run the sniffing block if we're inside a nested call
@@ -160,66 +152,6 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
     objc_setAssociatedObject(object, key, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     originalImplementationBlock();
     objc_setAssociatedObject(object, key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-+ (BOOL)instanceRespondsButDoesNotImplementSelector:(SEL)selector class:(Class)cls
-{
-    if ([cls instancesRespondToSelector:selector]) {
-        unsigned int numMethods = 0;
-        Method *methods = class_copyMethodList(cls, &numMethods);
-        
-        BOOL implementsSelector = NO;
-        for (int index = 0; index < numMethods; index++) {
-            SEL methodSelector = method_getName(methods[index]);
-            if (selector == methodSelector) {
-                implementsSelector = YES;
-                break;
-            }
-        }
-        
-        free(methods);
-        
-        if (!implementsSelector) {
-            return YES;
-        }
-    }
-    
-    return NO;
-}
-
-+ (void)replaceImplementationOfKnownSelector:(SEL)originalSelector onClass:(Class)class withBlock:(id)block swizzledSelector:(SEL)swizzledSelector
-{
-    // This method is only intended for swizzling methods that are know to exist on the class.
-    // Bail if that isn't the case.
-    Method originalMethod = class_getInstanceMethod(class, originalSelector);
-    if (!originalMethod) {
-        return;
-    }
-
-    IMP implementation = imp_implementationWithBlock(block);
-    class_addMethod(class, swizzledSelector, implementation, method_getTypeEncoding(originalMethod));
-    Method newMethod = class_getInstanceMethod(class, swizzledSelector);
-    method_exchangeImplementations(originalMethod, newMethod);
-}
-
-+ (void)replaceImplementationOfSelector:(SEL)selector withSelector:(SEL)swizzledSelector forClass:(Class)cls withMethodDescription:(struct objc_method_description)methodDescription implementationBlock:(id)implementationBlock undefinedBlock:(id)undefinedBlock
-{
-    if ([self instanceRespondsButDoesNotImplementSelector:selector class:cls]) {
-        return;
-    }
-
-    IMP implementation = imp_implementationWithBlock((id)([cls instancesRespondToSelector:selector] ? implementationBlock : undefinedBlock));
-    
-    Method oldMethod = class_getInstanceMethod(cls, selector);
-    if (oldMethod) {
-        class_addMethod(cls, swizzledSelector, implementation, methodDescription.types);
-         
-        Method newMethod = class_getInstanceMethod(cls, swizzledSelector);
-        
-        method_exchangeImplementations(oldMethod, newMethod);
-    } else {
-        class_addMethod(cls, selector, implementation, methodDescription.types);
-    }
 }
 
 #pragma mark - Delegate Injection
@@ -325,7 +257,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
     dispatch_once(&onceToken, ^{
         Class class = [NSURLConnection class];
         SEL selector = @selector(cancel);
-        SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+        SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
         Method originalCancel = class_getInstanceMethod(class, selector);
 
         void (^swizzleBlock)(NSURLConnection *) = ^(NSURLConnection *slf) {
@@ -344,14 +276,19 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        Class class = [NSURLSessionTask class];
-        SEL selector = @selector(resume);
-        SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
-
-        if ([self instanceRespondsButDoesNotImplementSelector:selector class:class]) {
-            // Dummy NSURLSessionTask to get the actual class, needed for iOS 7 (__NSCFURLSessionTask)
-            class = [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:@"about:blank"]] superclass];
+        // In iOS 7 resume lives in __NSCFLocalSessionTask
+        // In iOS 8 resume lives in NSURLSessionTask
+        // In iOS 9 resume lives in __NSCFURLSessionTask
+        Class class = Nil;
+        if (![[NSProcessInfo processInfo] respondsToSelector:@selector(operatingSystemVersion)]) {
+            class = NSClassFromString([@[@"__", @"NSC", @"FLocalS", @"ession", @"Task"] componentsJoinedByString:@""]);
+        } else if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion < 9) {
+            class = [NSURLSessionTask class];
+        } else {
+            class = NSClassFromString([@[@"__", @"NSC", @"FURLS", @"ession", @"Task"] componentsJoinedByString:@""]);
         }
+        SEL selector = @selector(resume);
+        SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
         Method originalResume = class_getInstanceMethod(class, selector);
 
@@ -373,7 +310,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
     dispatch_once(&onceToken, ^{
         Class class = objc_getMetaClass(class_getName([NSURLConnection class]));
         SEL selector = @selector(sendAsynchronousRequest:queue:completionHandler:);
-        SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+        SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
         typedef void (^NSURLConnectionAsyncCompletion)(NSURLResponse* response, NSData* data, NSError* connectionError);
 
@@ -403,7 +340,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
             }
         };
         
-        [self replaceImplementationOfKnownSelector:selector onClass:class withBlock:asyncSwizzleBlock swizzledSelector:swizzledSelector];
+        [FLEXUtility replaceImplementationOfKnownSelector:selector onClass:class withBlock:asyncSwizzleBlock swizzledSelector:swizzledSelector];
     });
 }
 
@@ -413,7 +350,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
     dispatch_once(&onceToken, ^{
         Class class = objc_getMetaClass(class_getName([NSURLConnection class]));
         SEL selector = @selector(sendSynchronousRequest:returningResponse:error:);
-        SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+        SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
         NSData *(^syncSwizzleBlock)(Class, NSURLRequest *, NSURLResponse **, NSError **) = ^NSData *(Class slf, NSURLRequest *request, NSURLResponse **response, NSError **error) {
             NSData *data = nil;
@@ -445,7 +382,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
             return data;
         };
         
-        [self replaceImplementationOfKnownSelector:selector onClass:class withBlock:syncSwizzleBlock swizzledSelector:swizzledSelector];
+        [FLEXUtility replaceImplementationOfKnownSelector:selector onClass:class withBlock:syncSwizzleBlock swizzledSelector:swizzledSelector];
     });
 }
 
@@ -457,7 +394,6 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 
         // The method signatures here are close enough that we can use the same logic to inject into all of them.
         const SEL selectors[] = {
-            @selector(dataTaskWithHTTPGetRequest:completionHandler:),
             @selector(dataTaskWithRequest:completionHandler:),
             @selector(dataTaskWithURL:completionHandler:),
             @selector(downloadTaskWithRequest:completionHandler:),
@@ -469,9 +405,9 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 
         for (int selectorIndex = 0; selectorIndex < numSelectors; selectorIndex++) {
             SEL selector = selectors[selectorIndex];
-            SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+            SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
-            if ([self instanceRespondsButDoesNotImplementSelector:selector class:class]) {
+            if ([FLEXUtility instanceRespondsButDoesNotImplementSelector:selector class:class]) {
                 // iOS 7 does not implement these methods on NSURLSession. We actually want to
                 // swizzle __NSCFURLSession, which we can get from the class of the shared session
                 class = [[NSURLSession sharedSession] class];
@@ -479,7 +415,10 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 
             NSURLSessionTask *(^asyncDataOrDownloadSwizzleBlock)(Class, id, NSURLSessionAsyncCompletion) = ^NSURLSessionTask *(Class slf, id argument, NSURLSessionAsyncCompletion completion) {
                 NSURLSessionTask *task = nil;
-                if ([FLEXNetworkObserver isEnabled]) {
+                // If completion block was not provided sender expect to receive delegated methods or does not
+                // interested in callback at all. In this case we should just call original method implementation
+                // with nil completion block.
+                if ([FLEXNetworkObserver isEnabled] && completion) {
                     NSString *requestID = [self nextRequestID];
                     NSString *mechanism = [self mechansimFromClassMethod:selector onClass:class];
                     NSURLSessionAsyncCompletion completionWrapper = [self asyncCompletionWrapperForRequestID:requestID mechanism:mechanism completion:completion];
@@ -491,7 +430,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
                 return task;
             };
             
-            [self replaceImplementationOfKnownSelector:selector onClass:class withBlock:asyncDataOrDownloadSwizzleBlock swizzledSelector:swizzledSelector];
+            [FLEXUtility replaceImplementationOfKnownSelector:selector onClass:class withBlock:asyncDataOrDownloadSwizzleBlock swizzledSelector:swizzledSelector];
         }
     });
 }
@@ -513,9 +452,9 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 
         for (int selectorIndex = 0; selectorIndex < numSelectors; selectorIndex++) {
             SEL selector = selectors[selectorIndex];
-            SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+            SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
-            if ([self instanceRespondsButDoesNotImplementSelector:selector class:class]) {
+            if ([FLEXUtility instanceRespondsButDoesNotImplementSelector:selector class:class]) {
                 // iOS 7 does not implement these methods on NSURLSession. We actually want to
                 // swizzle __NSCFURLSession, which we can get from the class of the shared session
                 class = [[NSURLSession sharedSession] class];
@@ -535,7 +474,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
                 return task;
             };
             
-            [self replaceImplementationOfKnownSelector:selector onClass:class withBlock:asyncUploadTaskSwizzleBlock swizzledSelector:swizzledSelector];
+            [FLEXUtility replaceImplementationOfKnownSelector:selector onClass:class withBlock:asyncUploadTaskSwizzleBlock swizzledSelector:swizzledSelector];
         }
     });
 }
@@ -574,7 +513,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
 + (void)injectWillSendRequestIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(connection:willSendRequest:redirectResponse:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLConnectionDataDelegate);
     if (!protocol) {
@@ -600,13 +539,13 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         return returnValue;
     };
     
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 + (void)injectDidReceiveResponseIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(connection:didReceiveResponse:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLConnectionDataDelegate);
     if (!protocol) {
@@ -629,13 +568,13 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
     
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 + (void)injectDidReceiveDataIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(connection:didReceiveData:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLConnectionDataDelegate);
     if (!protocol) {
@@ -658,13 +597,13 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
     
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 + (void)injectDidFinishLoadingIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(connectionDidFinishLoading:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLConnectionDataDelegate);
     if (!protocol) {
@@ -687,13 +626,13 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
     
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 + (void)injectDidFailWithErrorIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(connection:didFailWithError:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLConnectionDelegate);
     struct objc_method_description methodDescription = protocol_getMethodDescription(protocol, selector, NO, YES);
@@ -712,13 +651,13 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
     
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 + (void)injectTaskWillPerformHTTPRedirectionIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
     Protocol *protocol = @protocol(NSURLSessionTaskDelegate);
 
@@ -738,14 +677,14 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
 
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 
 }
 
 + (void)injectTaskDidReceiveDataIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(URLSession:dataTask:didReceiveData:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLSessionDataDelegate);
     
@@ -765,14 +704,14 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
     
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 
 }
 
 + (void)injectDataTaskDidBecomeDownloadTaskIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(URLSession:dataTask:didBecomeDownloadTask:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
     Protocol *protocol = @protocol(NSURLSessionDataDelegate);
 
@@ -792,13 +731,13 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
 
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 + (void)injectTaskDidReceiveResponseIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLSessionDataDelegate);
     
@@ -818,14 +757,14 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
     
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 
 }
 
 + (void)injectTaskDidCompleteWithErrorIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(URLSession:task:didCompleteWithError:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
     
     Protocol *protocol = @protocol(NSURLSessionTaskDelegate);
     struct objc_method_description methodDescription = protocol_getMethodDescription(protocol, selector, NO, YES);
@@ -844,20 +783,18 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
 
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 // Used for overriding AFNetworking behavior
 + (void)injectRespondsToSelectorIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(respondsToSelector:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
     //Protocol *protocol = @protocol(NSURLSessionTaskDelegate);
     Method method = class_getInstanceMethod(cls, selector);
     struct objc_method_description methodDescription = *method_getDescription(method);
-
-    typedef void (^NSURLSessionTaskDidCompleteWithErrorBlock)(id slf, SEL sel);
 
     BOOL (^undefinedBlock)(id <NSURLSessionTaskDelegate>, SEL) = ^(id slf, SEL sel) {
         return YES;
@@ -870,14 +807,14 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         return ((BOOL(*)(id, SEL, SEL))objc_msgSend)(slf, swizzledSelector, sel);
     };
 
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 
 + (void)injectDownloadTaskDidFinishDownloadingIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(URLSession:downloadTask:didFinishDownloadingToURL:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
     Protocol *protocol = @protocol(NSURLSessionDownloadDelegate);
     struct objc_method_description methodDescription = protocol_getMethodDescription(protocol, selector, NO, YES);
@@ -897,13 +834,13 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
 
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 }
 
 + (void)injectDownloadTaskDidWriteDataIntoDelegateClass:(Class)cls
 {
     SEL selector = @selector(URLSession:downloadTask:didWriteData:totalBytesWritten:totalBytesExpectedToWrite:);
-    SEL swizzledSelector = [self swizzledSelectorForSelector:selector];
+    SEL swizzledSelector = [FLEXUtility swizzledSelectorForSelector:selector];
 
     Protocol *protocol = @protocol(NSURLSessionDownloadDelegate);
     struct objc_method_description methodDescription = protocol_getMethodDescription(protocol, selector, NO, YES);
@@ -922,7 +859,7 @@ didBecomeDownloadTask:(NSURLSessionDownloadTask *)downloadTask delegate:(id <NSU
         }];
     };
 
-    [self replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
+    [FLEXUtility replaceImplementationOfSelector:selector withSelector:swizzledSelector forClass:cls withMethodDescription:methodDescription implementationBlock:implementationBlock undefinedBlock:undefinedBlock];
 
 }
 
@@ -959,14 +896,14 @@ static char const * const kFLEXRequestIDKey = "kFLEXRequestIDKey";
 
 - (void)performBlock:(dispatch_block_t)block
 {
-    if (self.isEnabled) {
+    if ([[self class] isEnabled]) {
         dispatch_async(_queue, block);
     }
 }
 
 - (FLEXInternalRequestState *)requestStateForRequestID:(NSString *)requestID
 {
-    FLEXInternalRequestState *requestState = [self.requestStatesForRequestIDs objectForKey:requestID];
+    FLEXInternalRequestState *requestState = self.requestStatesForRequestIDs[requestID];
     if (!requestState) {
         requestState = [[FLEXInternalRequestState alloc] init];
         [self.requestStatesForRequestIDs setObject:requestState forKey:requestID];
@@ -1143,7 +1080,8 @@ static char const * const kFLEXRequestIDKey = "kFLEXRequestIDKey";
         FLEXInternalRequestState *requestState = [self requestStateForRequestID:requestID];
 
         if (!requestState.dataAccumulator) {
-            requestState.dataAccumulator = [[NSMutableData alloc] initWithCapacity:(NSUInteger)totalBytesExpectedToWrite];
+            NSUInteger unsignedBytesExpectedToWrite = totalBytesExpectedToWrite > 0 ? (NSUInteger)totalBytesExpectedToWrite : 0;
+            requestState.dataAccumulator = [[NSMutableData alloc] initWithCapacity:unsignedBytesExpectedToWrite];
             [[FLEXNetworkRecorder defaultRecorder] recordResponseReceivedWithRequestID:requestID response:downloadTask.response];
 
             NSString *requestMechanism = [NSString stringWithFormat:@"NSURLSessionDownloadTask (delegate: %@)", [delegate class]];

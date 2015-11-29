@@ -62,7 +62,10 @@
 
     UISearchBar *searchBar = [[UISearchBar alloc] init];
     [searchBar sizeToFit];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     self.searchController = [[UISearchDisplayController alloc] initWithSearchBar:searchBar contentsController:self];
+#pragma clang diagnostic pop
     self.searchController.delegate = self;
     self.searchController.searchResultsDataSource = self;
     self.searchController.searchResultsDelegate = self;
@@ -219,7 +222,7 @@
     [self updateBytesReceived];
     [self updateFilteredBytesReceived];
 
-    FLEXNetworkTransaction *transaction = [notification.userInfo objectForKey:kFLEXNetworkRecorderUserInfoTransactionKey];
+    FLEXNetworkTransaction *transaction = notification.userInfo[kFLEXNetworkRecorderUserInfoTransactionKey];
     NSArray *tableViews = @[self.tableView];
     if (self.searchController.searchResultsTableView) {
         tableViews = [tableViews arrayByAddingObject:self.searchController.searchResultsTableView];
@@ -229,10 +232,10 @@
     for (UITableView *tableView in tableViews) {
         for (FLEXNetworkTransactionTableViewCell *cell in [tableView visibleCells]) {
             if ([cell.transaction isEqual:transaction]) {
-                NSIndexPath *indexPath = [tableView indexPathForCell:cell];
-                if (indexPath) {
-                    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
-                }
+                // Using -[UITableView reloadRowsAtIndexPaths:withRowAnimation:] is overkill here and kicks off a lot of
+                // work that can make the table view somewhat unresponseive when lots of updates are streaming in.
+                // We just need to tell the cell that it needs to re-layout.
+                [cell setNeedsLayout];
                 break;
             }
         }
@@ -334,9 +337,9 @@
 {
     FLEXNetworkTransaction *transaction = nil;
     if (tableView == self.tableView) {
-        transaction = [self.networkTransactions objectAtIndex:indexPath.row];
+        transaction = self.networkTransactions[indexPath.row];
     } else if (tableView == self.searchController.searchResultsTableView) {
-        transaction = [self.filteredNetworkTransactions objectAtIndex:indexPath.row];
+        transaction = self.filteredNetworkTransactions[indexPath.row];
     }
     return transaction;
 }
@@ -358,9 +361,9 @@
             return [[transaction.request.URL absoluteString] rangeOfString:searchString options:NSCaseInsensitiveSearch].length > 0;
         }]];
         dispatch_async(dispatch_get_main_queue(), ^{
-            if ([self.searchDisplayController.searchBar.text isEqual:searchString]) {
+            if ([self.searchController.searchBar.text isEqual:searchString]) {
                 self.filteredNetworkTransactions = filteredNetworkTransactions;
-                [self.searchDisplayController.searchResultsTableView reloadData];
+                [self.searchController.searchResultsTableView reloadData];
             }
         });
     });

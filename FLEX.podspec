@@ -1,6 +1,6 @@
 Pod::Spec.new do |spec|
   spec.name             = "FLEX"
-  spec.version          = "2.0.2"
+  spec.version          = "2.1.1"
   spec.summary          = "A set of in-app debugging and exploration tools for iOS"
   spec.description      = <<-DESC
                         - Inspect and modify views in the hierarchy.
@@ -35,4 +35,5 @@ Pod::Spec.new do |spec|
   spec.frameworks       = "CoreGraphics"
   spec.libraries        = "z"
   spec.requires_arc     = true
+  spec.public_header_files = "Classes/**/FLEXManager.h"
 end
